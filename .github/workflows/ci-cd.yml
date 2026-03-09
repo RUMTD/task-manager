@@ -1,0 +1,210 @@
+name: CI/CD Pipeline - Task Manager
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  JAVA_VERSION: '17'
+  DOCKER_IMAGE: deployfast/task-manager
+  SONAR_PROJECT_KEY: deployfast_task-manager
+
+jobs:
+  # ============================================================
+  # JOB 1: Tests et analyse qualité (CI)
+  # ============================================================
+  test-and-analyze:
+    name: Tests & SonarQube
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: taskmanager_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Requis pour SonarQube (historique complet)
+
+      - name: Configuration JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      # Cache Maven pour accélérer les builds suivants
+      - name: Cache des dépendances Maven
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      # Cache SonarQube
+      - name: Cache SonarQube
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Compilation
+        run: mvn compile -B
+
+      - name: Exécution des tests avec couverture JaCoCo
+        run: mvn test jacoco:report -B
+        env:
+          SPRING_PROFILES_ACTIVE: test
+
+      - name: Vérification couverture minimale (60%)
+        run: mvn jacoco:check -B
+
+      - name: Publication des résultats de tests
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Résultats JUnit
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+
+      - name: Analyse SonarQube
+        run: mvn sonar:sonar -B
+          -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+          -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }}
+          -Dsonar.token=${{ secrets.SONAR_TOKEN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # JOB 2: Sécurité DevSecOps
+  # ============================================================
+  security-scan:
+    name: Scans de Sécurité
+    runs-on: ubuntu-latest
+    needs: test-and-analyze
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Configuration JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: Cache Maven
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+
+      # Scan des dépendances Maven (OWASP Dependency Check)
+      - name: Scan des dépendances (npm audit / composer audit)
+        run: mvn org.owasp:dependency-check-maven:check -B
+          -DfailBuildOnCVSS=7
+          -DsuppressionFile=.github/dependency-check-suppressions.xml
+        continue-on-error: true
+
+      # Détection de secrets dans le code
+      - name: Détection de secrets (TruffleHog)
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+  # ============================================================
+  # JOB 3: Déploiement — Build + Push sur Docker Hub (CD)
+  # Le déploiement consiste à publier l'image versionnée sur
+  # Docker Hub. L'image est ensuite disponible pour être tirée
+  # par n'importe quel environnement (staging, prod, etc.)
+  # ============================================================
+  deploy:
+    name: Déploiement → Docker Hub
+    runs-on: ubuntu-latest
+    needs: [test-and-analyze, security-scan]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    environment:
+      name: ${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+      url: https://hub.docker.com/r/deployfast/task-manager
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Connexion à Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Tag automatique selon la branche et les tags Git
+      # main  → latest + sha-<commit>
+      # develop → develop + sha-<commit>
+      # tag v1.2.0 → 1.2.0 (semver)
+      - name: Extraction des métadonnées Docker (tag automatique)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+
+      - name: Configuration Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build et push sur Docker Hub
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Scan de sécurité de l'image publiée (Trivy)
+      - name: Scan de vulnérabilités de l'image (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.DOCKER_IMAGE }}:latest
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'  # Rapporte sans bloquer
+
+      - name: Publication des résultats Trivy
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Résumé du déploiement
+        run: |
+          echo "### Déploiement réussi 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "**Image publiée :** ${{ env.DOCKER_IMAGE }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags :**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "**Docker Hub :** https://hub.docker.com/r/deployfast/task-manager" >> $GITHUB_STEP_SUMMARY
