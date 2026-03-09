@@ -20,6 +20,10 @@ jobs:
   test-and-analyze:
     name: Tests & SonarCloud
     runs-on: ubuntu-latest
+    permissions:
+      checks: write       # Requis par dorny/test-reporter pour publier les résultats
+      contents: read
+      pull-requests: write
 
     steps:
       - name: Checkout du code
@@ -70,8 +74,6 @@ jobs:
       - name: Analyse SonarCloud
         run: |
           mvn sonar:sonar -B \
-            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }} \
-            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }} \
             -Dsonar.host.url=https://sonarcloud.io \
             -Dsonar.token=${{ secrets.SONAR_TOKEN }}
         env:
