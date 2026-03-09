@@ -9,36 +9,23 @@ on:
 env:
   JAVA_VERSION: '17'
   DOCKER_IMAGE: deployfast/task-manager
-  SONAR_PROJECT_KEY: deployfast_task-manager
+  SONAR_PROJECT_KEY: RUMTD_task-manager
 
 jobs:
   # ============================================================
-  # JOB 1: Tests et analyse qualité (CI)
+  # JOB 1: Tests et analyse qualité (CI) → SonarCloud
+  # Pas besoin de service PostgreSQL : les tests utilisent H2
+  # en mémoire (voir application-test.yml)
   # ============================================================
   test-and-analyze:
-    name: Tests & SonarQube
+    name: Tests & SonarCloud
     runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: taskmanager_test
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
 
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Requis pour SonarQube (historique complet)
+          fetch-depth: 0  # Obligatoire pour SonarCloud
 
       - name: Configuration JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
@@ -46,7 +33,6 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: 'temurin'
 
-      # Cache Maven pour accélérer les builds suivants
       - name: Cache des dépendances Maven
         uses: actions/cache@v4
         with:
@@ -55,8 +41,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-maven-
 
-      # Cache SonarQube
-      - name: Cache SonarQube
+      - name: Cache SonarCloud
         uses: actions/cache@v4
         with:
           path: ~/.sonar/cache
@@ -82,11 +67,13 @@ jobs:
           path: target/surefire-reports/*.xml
           reporter: java-junit
 
-      - name: Analyse SonarQube
-        run: mvn sonar:sonar -B
-          -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
-          -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }}
-          -Dsonar.token=${{ secrets.SONAR_TOKEN }}
+      - name: Analyse SonarCloud
+        run: |
+          mvn sonar:sonar -B \
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }} \
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }} \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.token=${{ secrets.SONAR_TOKEN }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -114,14 +101,13 @@ jobs:
           path: ~/.m2/repository
           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
 
-      # Scan des dépendances Maven (OWASP Dependency Check)
-      - name: Scan des dépendances (npm audit / composer audit)
-        run: mvn org.owasp:dependency-check-maven:check -B
-          -DfailBuildOnCVSS=7
-          -DsuppressionFile=.github/dependency-check-suppressions.xml
+      - name: Scan des dépendances (OWASP Dependency Check)
+        run: |
+          mvn org.owasp:dependency-check-maven:check -B \
+            -DfailBuildOnCVSS=7 \
+            -DsuppressionFile=.github/dependency-check-suppressions.xml
         continue-on-error: true
 
-      # Détection de secrets dans le code
       - name: Détection de secrets (TruffleHog)
         uses: trufflesecurity/trufflehog@main
         with:
@@ -131,10 +117,7 @@ jobs:
           extra_args: --debug --only-verified
 
   # ============================================================
-  # JOB 3: Déploiement — Build + Push sur Docker Hub (CD)
-  # Le déploiement consiste à publier l'image versionnée sur
-  # Docker Hub. L'image est ensuite disponible pour être tirée
-  # par n'importe quel environnement (staging, prod, etc.)
+  # JOB 3: Déploiement → Docker Hub (CD)
   # ============================================================
   deploy:
     name: Déploiement → Docker Hub
@@ -155,10 +138,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Tag automatique selon la branche et les tags Git
-      # main  → latest + sha-<commit>
-      # develop → develop + sha-<commit>
-      # tag v1.2.0 → 1.2.0 (semver)
       - name: Extraction des métadonnées Docker (tag automatique)
         id: meta
         uses: docker/metadata-action@v5
@@ -183,7 +162,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Scan de sécurité de l'image publiée (Trivy)
       - name: Scan de vulnérabilités de l'image (Trivy)
         uses: aquasecurity/trivy-action@master
         with:
@@ -191,7 +169,7 @@ jobs:
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
-          exit-code: '0'  # Rapporte sans bloquer
+          exit-code: '0'
 
       - name: Publication des résultats Trivy
         uses: github/codeql-action/upload-sarif@v2
